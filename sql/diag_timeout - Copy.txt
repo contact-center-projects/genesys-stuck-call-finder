@@ -1,0 +1,121 @@
+/* =====================================================================
+   diag_timeout.sql - why did the stuck-call query start timing out?
+   Run in SSMS against ICON_VOICE. Every section is read-only and cheap
+   (DMVs / metadata / small tables) EXCEPT section 5, which is the same
+   G_PARTY work the app already does on every refresh.
+   Run section by section and send back the result grids.
+   ===================================================================== */
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET NOCOUNT ON;
+
+/* 1) Table sizes (from DMVs - no table scan) -------------------------- */
+SELECT t.name AS TableName,
+       SUM(ps.row_count)                AS RowCnt,
+       SUM(ps.used_page_count) * 8 / 1024 AS UsedMB
+FROM sys.dm_db_partition_stats ps
+JOIN sys.tables t ON t.object_id = ps.object_id
+WHERE ps.index_id IN (0, 1)
+  AND t.name IN ('G_USERDATA_HISTORY', 'G_PARTY', 'G_CALL_ACTIVE', 'G_CALL',
+                 'G_VIRTUAL_QUEUE', 'G_CUSTOM_DATA_S', 'G_CUSTOM_DATA_P')
+GROUP BY t.name
+ORDER BY RowCnt DESC;
+
+/* 2) Every index on the three tables the query touches ---------------- */
+SELECT t.name AS TableName, i.name AS IndexName, i.type_desc,
+       i.has_filter, i.filter_definition,
+       STUFF((SELECT ', ' + c.name
+              FROM sys.index_columns ic
+              JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+              WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
+                AND ic.is_included_column = 0
+              ORDER BY ic.key_ordinal FOR XML PATH('')), 1, 2, '') AS KeyColumns,
+       STUFF((SELECT ', ' + c.name
+              FROM sys.index_columns ic
+              JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+              WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
+                AND ic.is_included_column = 1
+              FOR XML PATH('')), 1, 2, '') AS IncludedColumns
+FROM sys.indexes i
+JOIN sys.tables t ON t.object_id = i.object_id
+WHERE t.name IN ('G_USERDATA_HISTORY', 'G_PARTY', 'G_CALL_ACTIVE')
+  AND i.index_id > 0
+ORDER BY t.name, i.index_id;
+
+/* 3) Column types that matter for joins/filters ----------------------- */
+SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, COLLATION_NAME
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE (TABLE_NAME = 'G_USERDATA_HISTORY' AND COLUMN_NAME IN ('CALLID', 'KEYNAME', 'VALUE', 'ADDED'))
+   OR (TABLE_NAME = 'G_PARTY'            AND COLUMN_NAME IN ('CALLID', 'TERMINATED'))
+   OR (TABLE_NAME = 'G_CALL_ACTIVE'      AND COLUMN_NAME IN ('CALLID', 'CREATED'))
+ORDER BY TABLE_NAME, COLUMN_NAME;
+
+/* 4) When were statistics last updated? A plan flip ~3 days ago usually
+      lines up with an auto-stats update on one of these. -------------- */
+SELECT t.name AS TableName, s.name AS StatName,
+       sp.last_updated, sp.rows, sp.rows_sampled, sp.modification_counter
+FROM sys.stats s
+JOIN sys.tables t ON t.object_id = s.object_id
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
+WHERE t.name IN ('G_USERDATA_HISTORY', 'G_PARTY', 'G_CALL_ACTIVE')
+ORDER BY sp.last_updated DESC;
+
+/* 5) Are there "zombie" active calls? After an ICON / T-Server restart or
+      link drop, calls can stay in G_CALL_ACTIVE / G_PARTY with
+      TERMINATED IS NULL forever. Each one becomes a "no agent leg"
+      candidate and costs ~2000 reads in the history lookup.
+      Several hundred old rows here would explain the timeouts. -------- */
+DECLARE @t0 datetime2 = SYSDATETIME();
+
+SELECT COUNT(*)                                                             AS ActiveCalls,
+       SUM(CASE WHEN CREATED < DATEADD(HOUR, -1,  GETUTCDATE()) THEN 1 ELSE 0 END) AS Older_1h,
+       SUM(CASE WHEN CREATED < DATEADD(HOUR, -4,  GETUTCDATE()) THEN 1 ELSE 0 END) AS Older_4h,
+       SUM(CASE WHEN CREATED < DATEADD(HOUR, -24, GETUTCDATE()) THEN 1 ELSE 0 END) AS Older_24h,
+       MIN(CREATED)                                                         AS OldestCreatedUtc
+FROM G_CALL_ACTIVE;
+
+-- Candidate set exactly as the app builds it, bucketed by age.
+WITH Parties AS (
+    SELECT p.CALLID,
+           MAX(CASE WHEN p.AGENTID > 0 THEN p.STATE END)       AS AgentState,
+           MAX(CASE WHEN p.ENDPOINTTYPE = 4 THEN 1 ELSE 0 END) AS InAcdQueue
+    FROM G_PARTY p
+    WHERE p.TERMINATED IS NULL
+    GROUP BY p.CALLID
+)
+SELECT CASE WHEN c.CREATED >= DATEADD(MINUTE, -30, GETUTCDATE()) THEN '1: < 30 min'
+            WHEN c.CREATED >= DATEADD(HOUR,   -4,  GETUTCDATE()) THEN '2: 30 min - 4 h'
+            WHEN c.CREATED >= DATEADD(HOUR,   -24, GETUTCDATE()) THEN '3: 4 h - 24 h'
+            ELSE                                                      '4: > 24 h' END AS AgeBucket,
+       COUNT(*) AS Candidates
+FROM G_CALL_ACTIVE c
+JOIN Parties pt ON pt.CALLID = c.CALLID
+WHERE pt.InAcdQueue = 1 OR pt.AgentState IS NULL
+GROUP BY CASE WHEN c.CREATED >= DATEADD(MINUTE, -30, GETUTCDATE()) THEN '1: < 30 min'
+              WHEN c.CREATED >= DATEADD(HOUR,   -4,  GETUTCDATE()) THEN '2: 30 min - 4 h'
+              WHEN c.CREATED >= DATEADD(HOUR,   -24, GETUTCDATE()) THEN '3: 4 h - 24 h'
+              ELSE                                                      '4: > 24 h' END
+ORDER BY AgeBucket;
+
+SELECT DATEDIFF(MILLISECOND, @t0, SYSDATETIME()) AS Section5_ms;
+
+/* 6) Memory pressure: Page Life Expectancy. The history lookup is only
+      fast when cache-warm; a low PLE (< ~300 s) means pages are being
+      evicted and every refresh reads from disk. (Needs VIEW SERVER STATE -
+      skip if it errors.) --------------------------------------------- */
+SELECT RTRIM(object_name) AS ObjectName, cntr_value AS PageLifeExpectancySec
+FROM sys.dm_os_performance_counters
+WHERE counter_name = 'Page life expectancy';
+
+/* 7) Anything else heavy running right now (ICON purge, GIM extract,
+      index rebuild, someone's report)? Run this WHILE the app is
+      refreshing. (Needs VIEW SERVER STATE.) ---------------------------- */
+SELECT r.session_id, r.blocking_session_id, r.status, r.command,
+       r.wait_type, r.wait_time AS wait_ms,
+       r.total_elapsed_time / 1000 AS elapsed_sec,
+       r.logical_reads, s.program_name, s.host_name, s.login_name,
+       SUBSTRING(st.text, 1, 300) AS sql_text
+FROM sys.dm_exec_requests r
+JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) st
+WHERE r.session_id <> @@SPID AND s.is_user_process = 1
+ORDER BY r.total_elapsed_time DESC;

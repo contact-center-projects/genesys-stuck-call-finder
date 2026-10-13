@@ -1,0 +1,71 @@
+/* =====================================================================
+   diag_state_breakdown_v2.sql - safer version. Same goal as v1 (see the
+   full state breakdown for a queue, not just the 2 states the app
+   filters for) but keeps the SAME narrow time window the app already
+   uses, so cost stays close to the ~13s/340-calls we already measured,
+   not open-ended. If this is still slow, cancel it too and tell me the
+   elapsed time before cancelling - that's still useful data.
+   ===================================================================== */
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET NOCOUNT ON;
+
+DECLARE @queue varchar(255) = N'LeumiCall_SECTOR_2';
+DECLARE @t datetime2 = SYSDATETIME();
+
+WITH Parties AS (
+    SELECT p.CALLID,
+        MAX(CASE WHEN p.AGENTID > 0 THEN p.AGENTID END)        AS AgentID,
+        MAX(CASE WHEN p.AGENTID > 0 THEN p.STATE END)          AS AgentState,
+        MAX(CASE WHEN p.ENDPOINTTYPE = 4 THEN 1 ELSE 0 END)    AS InAcdQueue,
+        MAX(CASE WHEN p.AGENTID > 0 OR p.ENDPOINTTYPE = 4
+                 THEN p.CREATED END)                           AS WaitLegCreated,
+        MAX(CASE WHEN p.AGENTID IS NULL OR p.AGENTID = 0
+                 THEN p.ENDPOINTDN END)                        AS QueueEndpointDN
+    FROM G_PARTY p WITH (NOLOCK)
+    WHERE p.TERMINATED IS NULL
+    GROUP BY p.CALLID
+),
+-- NOTE: no state filter here (that's the only change from the app's
+-- Candidates CTE) - every live call with any open party, not just the
+-- two states we normally act on.
+Live AS (
+    SELECT c.CALLID, c.CALLANI, c.CREATED AS CallCreated,
+           pt.AgentID, pt.AgentState, pt.InAcdQueue, pt.WaitLegCreated, pt.QueueEndpointDN
+    FROM G_CALL_ACTIVE c
+    JOIN Parties pt ON pt.CALLID = c.CALLID
+),
+-- SAME bounded window as the app - this is what keeps it cheap.
+Tagged AS (
+    SELECT l.CALLID, MIN(h.ADDED) AS FirstTagged
+    FROM Live l
+    JOIN G_USERDATA_HISTORY h WITH (NOLOCK) ON h.CALLID = l.CALLID
+    WHERE h.VALUE = @queue
+      AND h.ADDED >= COALESCE(l.WaitLegCreated, l.CallCreated)
+      AND h.ADDED <  DATEADD(MINUTE, 10, COALESCE(l.WaitLegCreated, l.CallCreated))
+    GROUP BY l.CALLID
+)
+SELECT
+    CASE
+        WHEN l.AgentState IS NULL AND l.InAcdQueue = 1 THEN 'in acd queue'
+        WHEN l.AgentState IS NULL AND l.InAcdQueue = 0 THEN 'no agent leg'
+        WHEN l.AgentState = 2                          THEN 'ringing agent (2)'
+        WHEN l.AgentState = 4                          THEN 'waiting/reserved (4)'
+        WHEN l.AgentState = 3                          THEN 'connected (3)'
+        ELSE CONCAT('agent state=', l.AgentState)
+    END AS StateDesc,
+    COUNT(*) AS CallCount
+FROM Live l
+LEFT JOIN Tagged t ON t.CALLID = l.CALLID
+WHERE t.CALLID IS NOT NULL OR l.QueueEndpointDN = @queue
+GROUP BY
+    CASE
+        WHEN l.AgentState IS NULL AND l.InAcdQueue = 1 THEN 'in acd queue'
+        WHEN l.AgentState IS NULL AND l.InAcdQueue = 0 THEN 'no agent leg'
+        WHEN l.AgentState = 2                          THEN 'ringing agent (2)'
+        WHEN l.AgentState = 4                          THEN 'waiting/reserved (4)'
+        WHEN l.AgentState = 3                          THEN 'connected (3)'
+        ELSE CONCAT('agent state=', l.AgentState)
+    END
+ORDER BY StateDesc;
+
+SELECT DATEDIFF(MILLISECOND, @t, SYSDATETIME()) AS Elapsed_ms;
